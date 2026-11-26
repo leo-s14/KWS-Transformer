@@ -44,7 +44,8 @@ class MultiHeadSelfAttention(tf.keras.layers.Layer):
         self.query_dense = Dense(embed_dim, kernel_initializer=TruncatedNormal(mean=0., stddev=TRUNC_STD), use_bias=False)
         self.key_dense = Dense(embed_dim, kernel_initializer=TruncatedNormal(mean=0., stddev=TRUNC_STD), use_bias=False)
         self.value_dense = Dense(embed_dim, kernel_initializer=TruncatedNormal(mean=0., stddev=TRUNC_STD), use_bias=False)
-        self.combine_heads = Dense(embed_dim, kernel_initializer=TruncatedNormal(mean=0., stddev=TRUNC_STD), bias_initializer=Zeros())
+        # The current COMET MHA datapath disables projection biases
+        self.combine_heads = Dense(embed_dim, kernel_initializer=TruncatedNormal(mean=0., stddev=TRUNC_STD), use_bias=False)
 
 
     def attention(self, query, key, value):
@@ -87,9 +88,9 @@ class TransformerBlock(tf.keras.layers.Layer):
 
         self.ffn = tf.keras.Sequential(
             [
-                Dense(ff_dim, kernel_initializer=TruncatedNormal(mean=0., stddev=TRUNC_STD), bias_initializer=Zeros()),
+                Dense(ff_dim, kernel_initializer=TruncatedNormal(mean=0., stddev=TRUNC_STD), use_bias=True, bias_initializer=Zeros()),
                 tfa.layers.GELU(approximate=approximate_gelu),
-                Dense(embed_dim, kernel_initializer=TruncatedNormal(mean=0., stddev=TRUNC_STD), bias_initializer=Zeros()),
+                Dense(embed_dim, kernel_initializer=TruncatedNormal(mean=0., stddev=TRUNC_STD), use_bias=True, bias_initializer=Zeros()),
             ]
         )
 
@@ -133,15 +134,21 @@ class KWSTransformer(tf.keras.Model):
         prenorm=False,
         distill_token=False,
         approximate_gelu=False,
+        pooling='cls',
     ):
         super(KWSTransformer, self).__init__()
         self.d_model = d_model
         self.num_layers = num_layers
+        if pooling not in ('cls', 'mean'):
+            raise ValueError('Unsupported pooling: %s' % pooling)
+        if pooling == 'mean' and distill_token:
+            raise ValueError('Mean pooling does not support distillation tokens')
+        self.pooling = pooling
 
-        additional_tokens = 2 if distill_token else 1
+        additional_tokens = 0 if pooling == 'mean' else (2 if distill_token else 1)
         self.pos_emb = self.add_weight(
             "pos_emb", shape=(1, num_patches + additional_tokens, d_model), initializer=TruncatedNormal(mean=0., stddev=TRUNC_STD))
-        self.class_emb = self.add_weight("class_emb", shape=(1, 1, d_model), initializer=TruncatedNormal(mean=0., stddev=TRUNC_STD))
+        self.class_emb = self.add_weight("class_emb", shape=(1, 1, d_model), initializer=TruncatedNormal(mean=0., stddev=TRUNC_STD)) if pooling == 'cls' else None
         self.distill_emb = self.add_weight("distill_emb", shape=(1, 1, d_model), initializer=TruncatedNormal(mean=0., stddev=TRUNC_STD)) if distill_token else None
         self.patch_proj = Dense(d_model, kernel_initializer=TruncatedNormal(mean=0., stddev=TRUNC_STD), bias_initializer=Zeros(), input_shape=(98,40,))
 
@@ -168,22 +175,26 @@ class KWSTransformer(tf.keras.Model):
         batch_size = tf.shape(x)[0]
         x = self.patch_proj(x)
 
-        class_emb = tf.broadcast_to(
-            self.class_emb, [batch_size, 1, self.d_model]
-        )
-        if self.distill_emb is not None:
-            distill_emb = tf.broadcast_to(
-                self.distill_emb, [batch_size, 1, self.d_model]
+        if self.class_emb is not None:
+            class_emb = tf.broadcast_to(
+                self.class_emb, [batch_size, 1, self.d_model]
             )
-            tokens = [class_emb, distill_emb, x]
-        else:
-            tokens = [class_emb, x]
-
-        x = tf.concat(tokens, axis=1)
+            if self.distill_emb is not None:
+                distill_emb = tf.broadcast_to(
+                    self.distill_emb, [batch_size, 1, self.d_model]
+                )
+                tokens = [class_emb, distill_emb, x]
+            else:
+                tokens = [class_emb, x]
+            x = tf.concat(tokens, axis=1)
         x = x + self.pos_emb
 
         for layer in self.enc_layers:
             x, _ = layer(x, training)
+
+        if self.pooling == 'mean':
+            # Average the audio tokens after the final encoder: [B, T, D] -> [B, D].
+            return tf.reduce_mean(x, axis=1)
 
         # First (class token) is used for classification, second for distillation (if enabled)
         class_output = x[:, 0] #取出第一列（即class_token_embedding）（B,hidden_size）

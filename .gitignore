@@ -1,0 +1,6 @@
+/data2/
+.venv
+venv-kwt/
+__pycache__/
+mya_model/
+models_data_v2_12_labels/

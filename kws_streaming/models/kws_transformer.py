@@ -29,8 +29,6 @@ from kws_streaming.models.star_former_utils import Star2Transformer
 
 from kws_streaming.models.pool_transformer_utils import poolTransformer
 
-from kws_streaming.models.hybrid import hybridTransformer
-
 import tensorflow_addons as tfa
 
 from tensorflow.keras.layers import (
@@ -47,6 +45,9 @@ TRUNC_STD = 0.02
 
 def model_parameters(parser_nn):
   """Keyword-Transformer model parameters."""
+  parser_nn.add_argument(
+      '--pooling', choices=('cls', 'mean'), default='cls',
+      help='Classifier input: class token or mean of audio-token outputs.')
   parser_nn.add_argument(
       '--num_layers',
       type=int,
@@ -152,6 +153,13 @@ def model(flags):
 
   if flags.attention_type == 'patch':
      patch_size_t, patch_size_f = utils.parse(flags.patch_size)
+
+     padding_frames = (-int(num_time_windows)) % patch_size_t
+     if padding_frames:
+        net = tf.keras.layers.ZeroPadding1D(
+            padding=(0, padding_frames))(net)
+
+     _, num_time_windows, num_freqs = net.shape
      num_patches = (num_time_windows // patch_size_t) * (num_freqs // patch_size_f)
      net = tf.expand_dims(net, axis=-1)
      patch_transformer = KWSTransformer(num_layers=flags.num_layers,
@@ -161,6 +169,7 @@ def model(flags):
         mlp_dim=flags.mlp_dim,
         dropout=flags.dropout1,
         num_patches=num_patches,
+        pooling=flags.pooling,
         prenorm=flags.prenorm,
         distill_token=distill_token,
         approximate_gelu=flags.approximate_gelu,
@@ -178,6 +187,7 @@ def model(flags):
         dropout=flags.dropout1,
         num_patches=num_time_windows,
         prenorm=flags.prenorm,
+        pooling=flags.pooling,
         distill_token=distill_token,
         approximate_gelu=flags.approximate_gelu,
         )
@@ -222,6 +232,7 @@ def model(flags):
         mlp_dim=flags.mlp_dim,
         dropout=flags.dropout1,
         num_patches=num_freqs,
+        pooling=flags.pooling,
         prenorm=flags.prenorm,
         distill_token=distill_token,
         approximate_gelu=flags.approximate_gelu
@@ -241,6 +252,7 @@ def model(flags):
     star_sig = star_transformer(net, training=flags.training)
 
   if flags.attention_type == 'hybrid':
+    from kws_streaming.models.hybrid import hybridTransformer
     hybrid_transformer = hybridTransformer(mlp_dim=flags.mlp_dim,
         hidden_size=flags.d_model,
         num_layers_star=flags.star_num_layers,
